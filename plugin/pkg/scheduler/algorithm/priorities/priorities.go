@@ -17,7 +17,13 @@ limitations under the License.
 package priorities
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"math"
+	//"golang/glog"
+	"io/ioutil"
+	"net/http"
+	"time"
 
 	"github.com/golang/glog"
 	"k8s.io/kubernetes/pkg/api"
@@ -34,11 +40,45 @@ func calculateScore(requested int64, capacity int64, node string) int {
 		return 0
 	}
 	if requested > capacity {
-		glog.Infof("Combined requested resources %d from existing pods exceeds capacity %d on node %s",
+		glog.V(2).Infof("Combined requested resources %d from existing pods exceeds capacity %d on node %s",
 			requested, capacity, node)
 		return 0
 	}
 	return int(((capacity - requested) * 10) / capacity)
+}
+
+type ResourceUsage []struct {
+	Name     string `json:"name,omitempty"`
+	CpuUsage int64  `json:"cpuUsage,omitempty"`
+	MemUsage int64  `json:"memUsage,omitempty"`
+}
+
+func GetStats() (ResourceUsage, error) {
+	// Trust Certificates
+	url := "https://10.245.1.2/api/v1/proxy/namespaces/kube-system/services/heapster/api/v1/model/nodes/"
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	var timeoutInterval int = 100
+	timeout := time.Duration(time.Duration(timeoutInterval) * time.Millisecond)
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	/* Authenticate */
+	req, err := http.NewRequest("GET", url, nil)
+	req.SetBasicAuth("vagrant", "vagrant")
+	response, err := client.Do(req)
+
+	var Stats ResourceUsage
+	if err != nil {
+		glog.V(0).Infof("ErrorY: %v\n timeoutInterval:%d\n", err, timeoutInterval)
+		if timeoutInterval < 1000 {
+			timeoutInterval += 50
+		}
+	} else {
+		defer response.Body.Close()
+		body, _ := ioutil.ReadAll(response.Body)
+		json.Unmarshal(body, &Stats)
+	}
+	return Stats, err
 }
 
 // For each of these resources, a pod that doesn't request the resource explicitly
@@ -94,9 +134,42 @@ func calculateResourceOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) al
 		totalMemory += memory
 	}
 
+	metrics, Err := GetStats()
+	/*	if Err == nil {
+			totalMilliCPU = metrics[0].CpuUsage
+			totalMemory = metrics[0].MemUsage
+			glog.V(0).Infof(
+				"totalMilliCPU = %d , totalMemory = %d ", totalMilliCPU, totalMemory,
+			)
+		}
+	*/
+	if Err == nil {
+		for _, v := range metrics {
+			if v.Name == node.Name {
+				totalMilliCPU = v.CpuUsage
+				totalMemory = v.MemUsage
+				glog.V(0).Infof(
+					"%s : TotalMilliCPU = %d , TotalMemory = %d ", v.Name, totalMilliCPU, totalMemory,
+				)
+			}
+		}
+		// Add the resources requested by the current pod being scheduled.
+		// This also helps differentiate between differently sized, but empty, nodes.
+		for _, container := range pod.Spec.Containers {
+			cpu, memory := getNonzeroRequests(&container.Resources.Requests)
+			totalMilliCPU += cpu
+			totalMemory += memory
+		}
+
+	}
+
+	if Err != nil {
+		glog.V(0).Infof(" Erro while fetching the heapster metrics.")
+	}
+
 	cpuScore := calculateScore(totalMilliCPU, capacityMilliCPU, node.Name)
 	memoryScore := calculateScore(totalMemory, capacityMemory, node.Name)
-	glog.V(10).Infof(
+	glog.V(0).Infof(
 		"%v -> %v: Least Requested Priority, Absolute/Requested: (%d, %d) / (%d, %d) Score: (%d, %d)",
 		pod.Name, node.Name,
 		totalMilliCPU, totalMemory,
@@ -209,9 +282,32 @@ func calculateBalancedResourceAllocation(pod *api.Pod, node api.Node, pods []*ap
 		totalMilliCPU += cpu
 		totalMemory += memory
 	}
-
 	capacityMilliCPU := node.Status.Capacity.Cpu().MilliValue()
 	capacityMemory := node.Status.Capacity.Memory().Value()
+
+	metrics, Err := GetStats()
+	if Err == nil {
+		for _, v := range metrics {
+			if v.Name == node.Name {
+				totalMilliCPU = v.CpuUsage
+				totalMemory = v.MemUsage
+				glog.V(0).Infof(
+					" %s : TotalMilliCPU = %d , TotalMemory = %d ", v.Name, totalMilliCPU, totalMemory,
+				)
+			}
+		}
+		// Add the resources requested by the current pod being scheduled.
+		// This also helps differentiate between differently sized, but empty, nodes.
+		for _, container := range pod.Spec.Containers {
+			cpu, memory := getNonzeroRequests(&container.Resources.Requests)
+			totalMilliCPU += cpu
+			totalMemory += memory
+		}
+
+	} else {
+		glog.V(0).Infof("Error while fetching the heapster metrics.")
+
+	}
 
 	cpuFraction := fractionOfCapacity(totalMilliCPU, capacityMilliCPU)
 	memoryFraction := fractionOfCapacity(totalMemory, capacityMemory)
