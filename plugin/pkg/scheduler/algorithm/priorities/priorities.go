@@ -53,7 +53,7 @@ type ResourceUsage []struct {
 	MemUsage int64  `json:"memUsage,omitempty"`
 }
 
-func GetStats() (ResourceUsage, error) {
+func GetStats_CPU_Mem() (ResourceUsage, error) {
 	// Trust Certificates
 	url := "https://10.245.1.2/api/v1/proxy/namespaces/kube-system/services/heapster/api/v1/model/nodes/"
 	tr := &http.Transport{
@@ -70,6 +70,67 @@ func GetStats() (ResourceUsage, error) {
 	var Stats ResourceUsage
 	if err != nil {
 		glog.V(0).Infof("ErrorY: %v\n timeoutInterval:%d\n", err, timeoutInterval)
+		if timeoutInterval < 1000 {
+			timeoutInterval += 50
+		}
+	} else {
+		defer response.Body.Close()
+		body, _ := ioutil.ReadAll(response.Body)
+		json.Unmarshal(body, &Stats)
+	}
+	return Stats, err
+}
+
+type IOStats struct {
+	Read  int64 `json:"Read,omitempty"`
+	Write int64 `json:"Write,omitempty"`
+}
+
+type Stats []struct {
+	IO    IOStats `json:"stats,omitempty"`
+	Major int64   `json:"major,omitempty"`
+}
+
+type DiskIOStats struct {
+	IO_serviced_bytes Stats `json:"io_serviced,omitempty"`
+}
+
+type Interfaces []struct {
+	Name     string `json:"name,omitempty"`
+	Rx_bytes int64  `json:"rx_bytes,omitempty"`
+	Tx_bytes int64  `json:"tx_bytes,omitempty"`
+}
+
+type NetworkStats struct {
+	Interfaces Interfaces `json:"interfaces,omitempty"`
+}
+
+type DiskUsage []struct {
+	DiskIO    DiskIOStats  `json:"diskio,omitempty"`
+	NetworkIO NetworkStats `json:"network,omitempty"`
+}
+
+type MachineStat struct {
+	Root DiskUsage `json:"/,omitempty"`
+}
+
+func GetStats_Disk_Net(IP string) (MachineStat, error) {
+	// Trust Certificates
+	url := "http://" + IP + ":4194/api/v2.0/stats"
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	var timeoutInterval int = 100
+	//timeout := time.Duration(time.Duration(timeoutInterval) * time.Millisecond)
+	client := &http.Client{Transport: tr /*, Timeout: timeout*/}
+	/* Authenticate */
+	req, err := http.NewRequest("GET", url, nil)
+	req.SetBasicAuth("vagrant", "vagrant")
+	response, err := client.Do(req)
+
+	var Stats MachineStat
+	if err != nil {
+		//		glog.V(0).Infof("ErrorY: %v\n timeoutInterval:%d\n", err, timeoutInterval)
 		if timeoutInterval < 1000 {
 			timeoutInterval += 50
 		}
@@ -116,6 +177,15 @@ func getNonzeroRequests(requests *api.ResourceList) (int64, int64) {
 func calculateResourceOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) algorithm.HostPriority {
 	totalMilliCPU := int64(0)
 	totalMemory := int64(0)
+	//The Disk I/O values are computed as the delta of the value from the beginning of the minute to the end of the minute
+	// The values for read and write are in KB
+	totalDiskIn := int64(0)
+	totalDiskOut := int64(0)
+	//Network IO is in bytes
+	totalNetIn := int64(0)
+	totalNetOut := int64(0)
+
+	pref := pod.Annotations["pref"]
 	capacityMilliCPU := node.Status.Capacity.Cpu().MilliValue()
 	capacityMemory := node.Status.Capacity.Memory().Value()
 
@@ -134,22 +204,27 @@ func calculateResourceOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) al
 		totalMemory += memory
 	}
 
-	metrics, Err := GetStats()
-	/*	if Err == nil {
-			totalMilliCPU = metrics[0].CpuUsage
-			totalMemory = metrics[0].MemUsage
-			glog.V(0).Infof(
-				"totalMilliCPU = %d , totalMemory = %d ", totalMilliCPU, totalMemory,
-			)
-		}
-	*/
+	metrics, Err := GetStats_CPU_Mem()
+
 	if Err == nil {
 		for _, v := range metrics {
 			if v.Name == node.Name {
 				totalMilliCPU = v.CpuUsage
 				totalMemory = v.MemUsage
+				Disk_Network_metrics, error := GetStats_Disk_Net(v.Name)
+				if error != nil {
+					glog.V(0).Infof("Error in fetching DiskIO and NetworkIO")
+				} else {
+					totalDiskIn = Disk_Network_metrics.Root[0].DiskIO.IO_serviced_bytes[0].IO.Read
+					totalDiskOut = Disk_Network_metrics.Root[0].DiskIO.IO_serviced_bytes[0].IO.Write
+					totalNetIn = Disk_Network_metrics.Root[0].NetworkIO.Interfaces[0].Rx_bytes
+					totalNetOut = Disk_Network_metrics.Root[0].NetworkIO.Interfaces[0].Tx_bytes
+					glog.V(0).Infof(
+						"%s : TotalDiskIO = %d/%d , Total NetworkIO = %d/%d ", v.Name, totalDiskIn, totalDiskOut, totalNetIn, totalNetOut,
+					)
+				}
 				glog.V(0).Infof(
-					"%s : TotalMilliCPU = %d , TotalMemory = %d ", v.Name, totalMilliCPU, totalMemory,
+					"%s : TotalMilliCPU = %d , TotalMemory = %d , TotalDiskIO = %d/%d , Total NetworkIO = %d/%d , PreferencE: %v , Preferencess: %s", v.Name, totalMilliCPU, totalMemory, totalDiskIn, totalDiskOut, totalNetIn, totalNetOut, pref, pref,
 				)
 			}
 		}
@@ -164,11 +239,34 @@ func calculateResourceOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) al
 	}
 
 	if Err != nil {
-		glog.V(0).Infof(" Erro while fetching the heapster metrics.")
+		glog.V(0).Infof(" Error while fetching the heapster metrics.")
 	}
 
 	cpuScore := calculateScore(totalMilliCPU, capacityMilliCPU, node.Name)
 	memoryScore := calculateScore(totalMemory, capacityMemory, node.Name)
+	// Disk/Network transfer rates have been hard coded , need to do something about it
+	// Assumtions considering generally observed metrics
+	// NetworkIO capacity : 1 Gbit/s
+	// DiskIO capacity : 70 MB/s
+	var diskInScore, diskOutScore, networkInScore, networkOutScore int
+	if (totalDiskIn/1024) > 5000 || (totalDiskOut/1024) > 5000 {
+		diskInScore = 10
+		diskOutScore = 10
+	} else {
+		diskInScore = calculateScore(totalDiskIn/1024, 5000, node.Name)
+		diskOutScore = calculateScore(totalDiskOut/1024, 5000, node.Name)
+	}
+	diskScore := (diskInScore + diskOutScore) / 2
+
+	if (totalNetIn > 7000000000) || (totalNetOut > 7000000000) {
+		networkInScore = 10
+		networkOutScore = 10
+	} else {
+		networkInScore = calculateScore(totalNetIn, 7000000000, node.Name)
+		networkOutScore = calculateScore(totalNetOut, 7000000000, node.Name)
+	}
+	networkScore := (networkInScore + networkOutScore) / 2
+
 	glog.V(0).Infof(
 		"%v -> %v: Least Requested Priority, Absolute/Requested: (%d, %d) / (%d, %d) Score: (%d, %d)",
 		pod.Name, node.Name,
@@ -177,9 +275,24 @@ func calculateResourceOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) al
 		cpuScore, memoryScore,
 	)
 
+	var Score int
+
+	switch pref {
+	case "cpu":
+		Score = (1/2)*cpuScore + (1/6)*(memoryScore+diskScore+networkScore)
+	case "memory":
+		Score = (1/2)*memoryScore + (1/6)*(cpuScore+diskScore+networkScore)
+	case "network":
+		Score = (1/2)*networkScore + (1/6)*(memoryScore+diskScore+cpuScore)
+	case "disk":
+		Score = (1/2)*diskScore + (1/6)*(memoryScore+networkScore+networkScore)
+	default:
+		Score = (cpuScore + memoryScore) / 2
+	}
+
 	return algorithm.HostPriority{
 		Host:  node.Name,
-		Score: int((cpuScore + memoryScore) / 2),
+		Score: Score,
 	}
 }
 
@@ -267,7 +380,12 @@ func BalancedResourceAllocation(pod *api.Pod, podLister algorithm.PodLister, nod
 func calculateBalancedResourceAllocation(pod *api.Pod, node api.Node, pods []*api.Pod) algorithm.HostPriority {
 	totalMilliCPU := int64(0)
 	totalMemory := int64(0)
+	totalDiskIn := int64(0)
+	totalDiskOut := int64(0)
+	totalNetIn := int64(0)
+	totalNetOut := int64(0)
 	score := int(0)
+	pref := pod.Annotations["pref"]
 	for _, existingPod := range pods {
 		for _, container := range existingPod.Spec.Containers {
 			cpu, memory := getNonzeroRequests(&container.Resources.Requests)
@@ -285,14 +403,29 @@ func calculateBalancedResourceAllocation(pod *api.Pod, node api.Node, pods []*ap
 	capacityMilliCPU := node.Status.Capacity.Cpu().MilliValue()
 	capacityMemory := node.Status.Capacity.Memory().Value()
 
-	metrics, Err := GetStats()
+	metrics, Err := GetStats_CPU_Mem()
 	if Err == nil {
 		for _, v := range metrics {
 			if v.Name == node.Name {
 				totalMilliCPU = v.CpuUsage
 				totalMemory = v.MemUsage
+				Disk_Network_metrics, error := GetStats_Disk_Net(v.Name)
+				if error != nil {
+					glog.V(0).Infof("Error in fetching DiskIO and NetworkIO")
+				} else {
+					totalDiskIn = Disk_Network_metrics.Root[0].DiskIO.IO_serviced_bytes[0].IO.Read
+					totalDiskOut = Disk_Network_metrics.Root[0].DiskIO.IO_serviced_bytes[0].IO.Write
+					totalNetIn = Disk_Network_metrics.Root[0].NetworkIO.Interfaces[0].Rx_bytes
+					totalNetOut = Disk_Network_metrics.Root[0].NetworkIO.Interfaces[0].Tx_bytes
+					glog.V(0).Infof(
+						"%s : TotalDiskIO = %d/%d , Total NetworkIO = %d/%d", v.Name, totalDiskIn, totalDiskOut, totalNetIn, totalNetOut,
+					)
+					glog.V(0).Infof(
+						" %s : TotalMilliCPU = %d , TotalMemory = %d ", v.Name, totalMilliCPU, totalMemory,
+					)
+				}
 				glog.V(0).Infof(
-					" %s : TotalMilliCPU = %d , TotalMemory = %d ", v.Name, totalMilliCPU, totalMemory,
+					"%s : TotalMilliCPU = %d , TotalMemory = %d , TotalDiskIO = %d/%d , Total NetworkIO = %d/%d , PreferencE: %v, Preference: %s, ", v.Name, totalMilliCPU, totalMemory, totalDiskIn, totalDiskOut, totalNetIn, totalNetOut, pref, pref,
 				)
 			}
 		}
